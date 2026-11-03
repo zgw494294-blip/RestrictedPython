@@ -21,6 +21,7 @@ the parsed python code to create a modified AST for a byte code generation.
 import ast
 import collections
 import contextlib
+import copy
 import textwrap
 import typing
 
@@ -1324,3 +1325,342 @@ class RestrictingNodeTransformer(ast.NodeTransformer):
                 node,
                 "Assignment expressions are only allowed for simple targets")
         return node
+
+    # Structural pattern matching (PEP 634, Python 3.10+)
+    #
+    # ``match`` statements are lowered into nested if statements that call
+    # the trusted ``_match_`` runtime helper (see ``Guards.guarded_match``).
+    # The subject is evaluated exactly once into a temporary variable, each
+    # case pattern is compiled to a pattern specification and the helper
+    # returns a dict of captured names (or ``None``).  Mapping values are
+    # read through ``_getitem_`` and sequence destructuring through
+    # ``_getiter_``; dotted constants, the subject, guards and case bodies
+    # are transformed normally and therefore keep going through
+    # ``_getattr_``.  Class patterns stay rejected.
+
+    def visit_MatchClass(self, node: ast.AST) -> _T_visit_return:
+        """Class patterns are not allowed."""
+        self.error(node, 'Class patterns are not allowed.')
+
+    def _match_visit_statements(
+            self, statements: list[ast.stmt]) -> list[ast.stmt]:
+        new_statements: list[ast.stmt] = []
+        for statement in statements:
+            result = self.visit(statement)
+            if isinstance(result, ast.stmt):
+                new_statements.append(result)
+            elif result is not None:
+                new_statements.extend(result)
+        return new_statements
+
+    def _match_spec_tuple(self, elements: list[typing.Any]) -> ast.Tuple:
+        nodes: list[ast.expr] = []
+        for element in elements:
+            if not isinstance(element, ast.expr):
+                element = ast.Constant(element)
+            nodes.append(element)
+        return ast.Tuple(nodes, ast.Load())
+
+    def _match_thunk(self, expression: ast.expr) -> ast.Lambda:
+        # Value and key expressions are wrapped in zero argument lambdas so
+        # they are only evaluated when the matching actually needs them
+        # (branches that are never tried and unrelated mapping fields are
+        # never evaluated).
+        return ast.Lambda(
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[]),
+            body=expression)
+
+    def _match_build_spec(self, pattern: ast.pattern) -> ast.expr:
+        """Compile a pattern node into a pattern specification expression."""
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.pattern is None:
+                if pattern.name is None:
+                    return self._match_spec_tuple(['W'])
+                return self._match_spec_tuple(['C', pattern.name])
+            sub_spec = self._match_build_spec(pattern.pattern)
+            if pattern.name is None:
+                return sub_spec
+            return self._match_spec_tuple(['A', sub_spec, pattern.name])
+
+        if isinstance(pattern, ast.MatchSingleton):
+            return self._match_spec_tuple(['S', pattern.value])
+
+        if isinstance(pattern, ast.MatchValue):
+            value = self.visit(pattern.value)
+            return self._match_spec_tuple(['V', self._match_thunk(value)])
+
+        if isinstance(pattern, ast.MatchOr):
+            alternatives = [
+                self._match_build_spec(alternative)
+                for alternative in pattern.patterns]
+            return self._match_spec_tuple(
+                ['O', ast.Tuple(alternatives, ast.Load())])
+
+        if isinstance(pattern, ast.MatchSequence):
+            sub_specs: list[ast.expr] = []
+            star_index = -1
+            star_name: str | None = None
+            for index, sub_pattern in enumerate(pattern.patterns):
+                if isinstance(sub_pattern, ast.MatchStar):
+                    star_index = index
+                    star_name = sub_pattern.name
+                else:
+                    sub_specs.append(self._match_build_spec(sub_pattern))
+            return self._match_spec_tuple([
+                'L',
+                ast.Tuple(sub_specs, ast.Load()),
+                # The star index counts non star patterns, which equals the
+                # star position in the original pattern.
+                star_index,
+                star_name])
+
+        if isinstance(pattern, ast.MatchMapping):
+            entries: list[ast.expr] = []
+            for key_expression, sub_pattern in zip(
+                    pattern.keys, pattern.patterns):
+                entries.append(ast.Tuple(
+                    elts=[
+                        self._match_thunk(self.visit(key_expression)),
+                        self._match_build_spec(sub_pattern)],
+                    ctx=ast.Load()))
+            return self._match_spec_tuple([
+                'M',
+                ast.Tuple(entries, ast.Load()),
+                pattern.rest])
+
+        if isinstance(pattern, ast.MatchClass):
+            # Explicitly dispatch to the rejecting visitor (patterns are not
+            # traversed by the generic node visitor) and emit a placeholder so
+            # transformation can continue to collect further errors.
+            self.visit_MatchClass(pattern)
+            return self._match_spec_tuple(['W'])
+
+        # A bare ``ast.MatchStar`` cannot occur outside a sequence pattern.
+        # Emit a wildcard so the transformation keeps producing a tree while
+        # the recorded error prevents compilation.
+        return self._match_spec_tuple(['W'])
+
+    def _match_collect_names(
+            self, node: T_pos_ast, pattern: ast.pattern) -> set[str]:
+        """Collect the names a pattern captures and check the restrictions.
+
+        This mirrors the compile time checks CPython performs on patterns:
+        capture names use the same name restrictions as all other names,
+        duplicate captures are rejected and alternatives of an or pattern
+        have to bind the same set of names.
+        """
+        name_sets: list[set[str]] = []
+
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.pattern is not None:
+                name_sets.append(
+                    self._match_collect_names(node, pattern.pattern))
+            if pattern.name is not None:
+                self.check_name(pattern, pattern.name)
+                name_sets.append({pattern.name})
+
+        elif isinstance(pattern, ast.MatchStar):
+            if pattern.name is not None:
+                self.check_name(pattern, pattern.name)
+                name_sets.append({pattern.name})
+
+        elif isinstance(pattern, ast.MatchSequence):
+            star_count = 0
+            for sub_pattern in pattern.patterns:
+                if isinstance(sub_pattern, ast.MatchStar):
+                    star_count += 1
+                name_sets.append(
+                    self._match_collect_names(node, sub_pattern))
+            if star_count > 1:
+                self.error(
+                    node,
+                    'multiple starred names in sequence pattern')
+
+        elif isinstance(pattern, ast.MatchMapping):
+            constant_keys: set[typing.Any] = set()
+            for key_expression, sub_pattern in zip(
+                    pattern.keys, pattern.patterns):
+                if isinstance(key_expression, ast.Constant):
+                    if key_expression.value in constant_keys:
+                        self.error(
+                            node,
+                            'mapping pattern checks duplicate key '
+                            '({0!r})'.format(key_expression.value))
+                    constant_keys.add(key_expression.value)
+                name_sets.append(
+                    self._match_collect_names(node, sub_pattern))
+            if pattern.rest is not None:
+                self.check_name(pattern, pattern.rest)
+                name_sets.append({pattern.rest})
+
+        elif isinstance(pattern, ast.MatchOr):
+            alternative_names = [
+                self._match_collect_names(node, sub_pattern)
+                for sub_pattern in pattern.patterns]
+            first_names = alternative_names[0]
+            for other_names in alternative_names[1:]:
+                if other_names != first_names:
+                    self.error(
+                        node,
+                        'alternative patterns bind different names')
+                    break
+            name_sets.append(first_names)
+
+        # MatchValue, MatchSingleton and MatchClass do not bind names.
+
+        names: set[str] = set()
+        for sub_names in name_sets:
+            for name in sub_names:
+                if name in names:
+                    self.error(
+                        node,
+                        'multiple assignments to name {0!r} in '
+                        'pattern'.format(name))
+                names.add(name)
+        return names
+
+    def _match_check_irrefutable(
+            self,
+            node: T_pos_ast,
+            pattern: ast.pattern,
+            irrefutable_allowed: bool) -> bool:
+        """Check irrefutable pattern placement like CPython does.
+
+        Returns whether the pattern is irrefutable.  Records an error when
+        an irrefutable pattern is followed by more alternatives.
+        """
+        if isinstance(pattern, ast.MatchAs) and pattern.pattern is None:
+            if not irrefutable_allowed:
+                if pattern.name is None:
+                    self.error(
+                        node,
+                        'wildcard makes remaining patterns unreachable')
+                else:
+                    self.error(
+                        node,
+                        'name capture {0!r} makes remaining patterns '
+                        'unreachable'.format(pattern.name))
+            return True
+
+        if isinstance(pattern, ast.MatchAs):
+            # MatchAs with a sub pattern is irrefutable iff the wrapped
+            # pattern is irrefutable.
+            assert pattern.pattern is not None
+            return self._match_check_irrefutable(
+                node, pattern.pattern, irrefutable_allowed)
+
+        if isinstance(pattern, ast.MatchOr):
+            irrefutable = False
+            last_index = len(pattern.patterns) - 1
+            for index, sub_pattern in enumerate(pattern.patterns):
+                sub_allowed = irrefutable_allowed and index == last_index
+                if self._match_check_irrefutable(
+                        node, sub_pattern, sub_allowed):
+                    irrefutable = True
+            return irrefutable
+
+        if isinstance(pattern, ast.MatchSequence):
+            # Sub patterns live in a nested context, where captures are
+            # always allowed; the sequence pattern itself stays refutable.
+            for sub_pattern in pattern.patterns:
+                self._match_check_irrefutable(node, sub_pattern, True)
+            return False
+
+        if isinstance(pattern, ast.MatchMapping):
+            for sub_pattern in pattern.patterns:
+                self._match_check_irrefutable(node, sub_pattern, True)
+            return False
+
+        # MatchValue, MatchSingleton, MatchStar and MatchClass are always
+        # refutable.
+        return False
+
+    def visit_Match(self, node: ast.Match) -> _T_visit_return:
+        """Lower a ``match`` statement into guarded if/elif statements."""
+        case_count = len(node.cases)
+
+        # Compile time validation of all patterns and name restrictions.
+        case_names: list[set[str]] = []
+        for index, case in enumerate(node.cases):
+            irrefutable_allowed = index == case_count - 1
+            self._match_check_irrefutable(
+                node, case.pattern, irrefutable_allowed)
+            case_names.append(self._match_collect_names(node, case.pattern))
+
+        # Evaluate the subject exactly once.
+        subject_expression = self.visit(node.subject)
+        subject_name = self.gen_tmp_name()
+        subject_assignment = ast.Assign(
+            targets=[ast.Name(subject_name, ast.Store())],
+            value=subject_expression)
+
+        # Build the nested case chain.  Both a pattern that does not match
+        # and a guard that is false continue with the next case, so each
+        # fallthrough path nests the remaining cases in its orelse.
+        def build_cases(index: int) -> list[ast.stmt]:
+            if index == case_count:
+                # No case matched: continue after the match statement.
+                return []
+
+            case = node.cases[index]
+            bindings_name = self.gen_tmp_name()
+            spec = self._match_build_spec(case.pattern)
+            matcher_call = ast.Call(
+                func=ast.Name('_match_', ast.Load()),
+                args=[
+                    ast.Name(subject_name, ast.Load()),
+                    spec,
+                    ast.Name('_getitem_', ast.Load()),
+                    ast.Name('_getiter_', ast.Load())],
+                keywords=[])
+            # ``(_tmp_bindings := _match_(...)) is not None``
+            test = ast.Compare(
+                left=ast.NamedExpr(
+                    target=ast.Name(bindings_name, ast.Store()),
+                    value=matcher_call),
+                ops=[ast.IsNot()],
+                comparators=[ast.Constant(value=None)])
+
+            body: list[ast.stmt] = []
+            # Successful captures are plain local assignments using the
+            # authorized values returned by the helper.
+            for name in sorted(case_names[index]):
+                body.append(ast.Assign(
+                    targets=[ast.Name(name, ast.Store())],
+                    value=ast.Subscript(
+                        value=ast.Name(bindings_name, ast.Load()),
+                        slice=ast.Constant(value=name),
+                        ctx=ast.Load())))
+
+            remaining = build_cases(index + 1)
+            case_body = self._match_visit_statements(case.body)
+            if case.guard is not None:
+                # The pattern matched: the guard decides between the case
+                # body and trying the remaining cases.  The same remaining
+                # cases are needed for a non matching pattern, so the tree
+                # is deep copied instead of sharing mutable AST nodes.
+                guard_failure = copy.deepcopy(remaining)
+                body.append(ast.If(
+                    test=self.visit(case.guard),
+                    body=case_body,
+                    orelse=guard_failure))
+                return [ast.If(test=test, body=body, orelse=remaining)]
+
+            body.extend(case_body)
+            return [ast.If(test=test, body=body, orelse=remaining)]
+
+        orelse = build_cases(0)
+
+        new_nodes: list[ast.stmt] = [subject_assignment]
+        new_nodes.extend(orelse)
+        for new_node in new_nodes:
+            copy_locations(new_node, node)
+            ast.fix_missing_locations(new_node)
+        return new_nodes

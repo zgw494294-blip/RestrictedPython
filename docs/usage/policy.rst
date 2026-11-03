@@ -36,8 +36,32 @@ RestrictedPython predefines several guarded access and manipulation methods:
 * ``guarded_delattr``
 * ``guarded_iter_unpack_sequence``
 * ``guarded_unpack_sequence``
+* ``guarded_match`` (the runtime helper behind ``match``/``case``, bound to
+  the ``_match_`` name in ``safe_globals``)
 
 Those and additional methods rely on a helper construct ``full_write_guard``, which is intended to help implement immutable and semi mutable objects and attributes.
+
+``match`` statements
+....................
+
+``match``/``case`` (structural pattern matching) is compiled into calls to
+the trusted ``guarded_match`` helper.  Hosts get the default binding by
+copying ``safe_globals`` as usual; no new guard has to be written.  The
+helper reuses the existing host guards:
+
+* mapping patterns (including the values of a ``**rest`` pattern) read
+  through ``_getitem_``,
+* sequence destructuring (including nested sequences and ``*rest``
+  captures) goes through ``_getiter_``,
+* dotted value constants, the subject expression, guards and case bodies
+  keep reading attributes through ``_getattr_``.
+
+A plain missing mapping key, or a value/type/shape mismatch, continues with
+the next case; exceptions raised by a guard or by a matched expression are
+propagated.  Captures and ``as`` keep the authorized objects returned by
+the guards, a ``*rest`` capture is a new ``list`` and a ``**rest`` capture
+is a new ``dict``.  Class patterns are rejected at compile time.  As with
+the rest of RestrictedPython, this is not a complete sandbox.
 
 .. todo::
 

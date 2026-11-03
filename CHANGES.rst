@@ -4,6 +4,20 @@ Changes
 8.6 (unreleased)
 ----------------
 
+- Support ``match``/``case`` (PEP 634 structural pattern matching) in
+  restricted code: literals, singletons, dotted value constants, captures,
+  wildcards, nested sequences with star captures, mappings with an optional
+  double star rest, ``as``, ``|`` and case guards.  Mapping values are read
+  through the host ``_getitem_`` guard, sequence destructuring goes through
+  ``_getiter_`` and dotted constants (as well as the subject, guards and
+  case bodies) keep using ``_getattr_``.  Captures use the values returned
+  by the guards; star captures are fresh ``list`` objects and mapping rests
+  are fresh ``dict`` objects.  Class patterns stay rejected at compile time
+  and ``policy=None`` stays unrestricted.  The new trusted
+  ``guarded_match`` helper is bound to ``_match_`` in ``safe_globals`` so
+  hosts can copy it like the other default bindings, while continuing to
+  provide the guards themselves.
+
 - Add a "Security considerations" documentation page. It explains why the guards
   only cover attribute access written in the restricted source, and why
   providing an ``__import__`` implementation hands the security boundary to the
